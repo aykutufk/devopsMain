@@ -3,6 +3,56 @@
   become: true
   gather_facts: false
 
+  vars:
+    # Host path mapped to /opt/sonarqube/logs in the sonar container.
+    sonarqube_log_dir: /var/lib/docker/volumes/55ee6c324f859cc363893af0a314733f66c74e7aa09f9d344234317aa1558b80/_data
+
+    alloy_file_logs:
+      jenkins:
+        - path: /var/lib/jenkins/jobs/deneme/builds/*/log
+          job: jenkins-build
+      nexus:
+        - path: /var/lib/docker/volumes/nexus-data/_data/log/request.log
+          job: nexus-request
+      nginx:
+        - path: /var/log/nginx/access.log
+          job: nginx-access
+        - path: /var/log/nginx/error.log
+          job: nginx-error
+      sonarqube:
+        - path: "{{ sonarqube_log_dir }}/access.log"
+          job: sonarqube-access
+        - path: "{{ sonarqube_log_dir }}/sonar.log"
+          job: sonarqube-main
+        - path: "{{ sonarqube_log_dir }}/web.log"
+          job: sonarqube-web
+        - path: "{{ sonarqube_log_dir }}/ce.log"
+          job: sonarqube-ce
+        - path: "{{ sonarqube_log_dir }}/es.log"
+          job: sonarqube-es
+
+    alloy_acl_paths:
+      jenkins:
+        - { path: /var/lib/jenkins/jobs/deneme/builds, permissions: rX, recursive: true }
+        - { path: /var/lib/jenkins/jobs/deneme/builds, permissions: rx, default: true }
+      nexus:
+        - { path: /var/lib/docker, permissions: x }
+        - { path: /var/lib/docker/volumes, permissions: x }
+        - { path: /var/lib/docker/volumes/nexus-data, permissions: x }
+        - { path: /var/lib/docker/volumes/nexus-data/_data, permissions: x }
+        - { path: /var/lib/docker/volumes/nexus-data/_data/log, permissions: rx }
+        - { path: /var/lib/docker/volumes/nexus-data/_data/log/request.log, permissions: r }
+        - { path: /var/lib/docker/volumes/nexus-data/_data/log, permissions: rx, default: true }
+      nginx:
+        - { path: /var/log/nginx, permissions: rX, recursive: true }
+        - { path: /var/log/nginx, permissions: rx, default: true }
+      sonarqube:
+        - { path: /var/lib/docker, permissions: x }
+        - { path: /var/lib/docker/volumes, permissions: x }
+        - { path: /var/lib/docker/volumes/55ee6c324f859cc363893af0a314733f66c74e7aa09f9d344234317aa1558b80, permissions: x }
+        - { path: "{{ sonarqube_log_dir }}", permissions: rX, recursive: true }
+        - { path: "{{ sonarqube_log_dir }}", permissions: rx, default: true }
+
   tasks:
     - name: Allow Alloy to read system logs
       ansible.builtin.user:
@@ -12,6 +62,22 @@
           - systemd-journal
         append: true
 
+    - name: Install ACL tools
+      ansible.builtin.package:
+        name: acl
+        state: present
+
+    - name: Allow Alloy to read application log paths
+      ansible.posix.acl:
+        path: "{{ item.path }}"
+        entity: alloy
+        etype: user
+        permissions: "{{ item.permissions }}"
+        recursive: "{{ item.recursive | default(false) }}"
+        default: "{{ item.default | default(false) }}"
+        state: present
+      loop: "{{ alloy_acl_paths[inventory_hostname] | default([]) }}"
+
     - name: Copy Alloy configuration
       ansible.builtin.copy:
         src: ../files/alloy/config.alloy
@@ -19,6 +85,25 @@
         owner: root
         group: alloy
         mode: "0640"
+
+    - name: Add application log source
+      ansible.builtin.blockinfile:
+        path: /etc/alloy/config.alloy
+        marker: "// {mark} ANSIBLE MANAGED APPLICATION LOGS"
+        block: |
+          loki.source.file "application" {
+            targets = [
+          {% for log in alloy_file_logs[inventory_hostname] %}
+              { "__path__" = "{{ log.path }}", "job" = "{{ log.job }}", "instance" = constants.hostname },
+          {% endfor %}
+            ]
+            file_match {
+              enabled = true
+            }
+            tail_from_end = false
+            forward_to = [loki.write.central.receiver]
+          }
+      when: inventory_hostname in alloy_file_logs
 
     - name: Validate Alloy configuration
       ansible.builtin.command:
